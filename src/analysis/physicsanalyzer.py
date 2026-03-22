@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, savgol_filter
 from scipy.optimize import curve_fit
 
 # --- CONFIGURATION ---
@@ -15,138 +15,142 @@ BASE_FOLDERS = {
 OUTPUT_DIR = "data/processed/physics_analysis"
 DIAG_DIR = os.path.join(OUTPUT_DIR, "diagnostics")
 TARGET_WIDTH = 1024
-EPSILON = 1e-7  # Prevents division by zero errors
+EPSILON = 1e-7
 
 
-def quadratic_bg(x, a, b, c):
-    return a * x**2 + b * x + c
+# --- PHYSICS MATH MODELS ---
+def lorentzian(x, amp, ctr, hwhm):
+    return amp * hwhm**2 / ((x - ctr) ** 2 + hwhm**2)
 
 
-def get_fwhm(y, peak_idx):
-    """Calculates width at 50% height with a local window to avoid overlap."""
-    half_max = y[peak_idx] / 2
-    # Local window of 80 pixels around peak
-    start, end = max(0, peak_idx - 40), min(len(y), peak_idx + 40)
-    window = y[start:end]
-    width_pts = np.where(window > half_max)[0]
-    return float(len(width_pts)) if len(width_pts) > 0 else 0.0
+def double_lorentzian(x, a1, c1, w1, a2, c2, w2):
+    """Fits two peaks in the center to handle saturation/splitting."""
+    return lorentzian(x, a1, c1, w1) + lorentzian(x, a2, c2, w2)
 
 
 def process_rheed(image_path, group, subgroup):
-    # 1. Load and Standardize (B&W + 1024px)
+    # 1. Load and Standardize
     img_raw = cv2.imread(image_path, 0)
     if img_raw is None:
         return None
-
     img = cv2.resize(
         img_raw, (TARGET_WIDTH, TARGET_WIDTH), interpolation=cv2.INTER_AREA
     )
     h, w = img.shape
-    mid_y = h // 2
     x = np.arange(w)
 
-    # 2. Profile Extraction & Background Subtraction
-    profile = np.mean(img[mid_y - 20 : mid_y + 20, :], axis=0)
-    try:
-        # Fit to 10% edges to model phosphor screen glow
-        mask = (x < w * 0.1) | (x > w * 0.9)
-        popt, _ = curve_fit(quadratic_bg, x[mask], profile[mask])
-        bg = quadratic_bg(x, *popt)
-        clean_y = np.maximum(profile - bg, 0)
-    except:
-        bg = np.zeros_like(x)
-        clean_y = profile
+    # 2. Profile Extraction & Smoothing
+    # We average the center band (40px) to reduce noise
+    profile = np.mean(img[h // 2 - 20 : h // 2 + 20, :], axis=0)
+    # Savgol filter helps locate real peaks in noisy MBE data (10.1)
+    smoothed = savgol_filter(profile, 51, 3)
+    clean_y = np.maximum(profile - np.percentile(profile, 15), 0)
 
-    # 3. Peak Finding (Find 3 most central streaks)
-    peaks, _ = find_peaks(clean_y, height=np.mean(clean_y) * 1.1, distance=w // 15)
+    # 3. Dynamic Peak Seeding (Finding the 'Dominant 3')
+    # Look for 3 tallest peaks with enough distance to be separate streaks
+    peaks, props = find_peaks(smoothed, height=np.mean(smoothed) * 0.5, distance=120)
     if len(peaks) < 1:
         return None
 
-    # Sort by proximity to center, then sort left-to-right
-    sorted_peaks = sorted(peaks, key=lambda p: abs(p - (w // 2)))[:3]
-    sorted_peaks.sort()
+    # Take the 3 tallest peaks and sort them Left-to-Right
+    best_peaks = peaks[np.argsort(props["peak_heights"])[-3:]]
+    best_peaks.sort()
 
-    # Map FWHM to Left, Center, Right
-    fwhms = {"L": None, "C": None, "R": None}
-    if len(sorted_peaks) == 3:
-        fwhms["L"], fwhms["C"], fwhms["R"] = [
-            get_fwhm(clean_y, p) for p in sorted_peaks
-        ]
-    elif len(sorted_peaks) == 1:
-        fwhms["C"] = get_fwhm(clean_y, sorted_peaks[0])
-    else:  # 2 peaks found
-        fwhms["L"] = get_fwhm(clean_y, sorted_peaks[0])
-        fwhms["C"] = get_fwhm(clean_y, sorted_peaks[1])
+    # Identify the Center peak (the one closest to the image middle 512)
+    center_idx_in_list = np.argmin(np.abs(best_peaks - 512))
 
-    # 4. Metric Calculations
-    # Sharpness = 100 / FWHM (Standardized to 1024px scale)
-    main_fwhm = fwhms["C"] if fwhms["C"] else (fwhms["L"] if fwhms["L"] else EPSILON)
-    sharpness = 100.0 / (main_fwhm + EPSILON)
+    # 4. Fitting Logic per Zone
+    results = {"fwhm_L": 0, "fwhm_C": 0, "fwhm_R": 0}
+    full_fit_visual = np.zeros_like(x)
 
-    # Flatness (clamped 0-1) - Uses Coefficient of Variation
-    peak_pos = sorted_peaks[1] if len(sorted_peaks) > 1 else sorted_peaks[0]
-    v_prof = img[:, peak_pos].astype(float)
-    cv = np.std(v_prof) / (np.mean(v_prof) + EPSILON)
-    flatness = np.clip(1.0 - cv, 0.0, 1.0)
+    for i, p_loc in enumerate(best_peaks):
+        # Window size for local fitting (120px wide)
+        win = 60
+        x_local = x[max(0, p_loc - win) : min(1024, p_loc + win)]
+        y_local = clean_y[max(0, p_loc - win) : min(1024, p_loc + win)]
 
-    # Symmetry Check (L vs R width difference)
-    sym_error = abs(fwhms["L"] - fwhms["R"]) if (fwhms["L"] and fwhms["R"]) else 0.0
+        try:
+            if i == center_idx_in_list:
+                # --- DOUBLE LORENTZIAN FOR CENTER (Handle Splitting) ---
+                # p0: [Amp1, Ctr1, Wid1, Amp2, Ctr2, Wid2]
+                p0 = [np.max(y_local), p_loc - 15, 10, np.max(y_local), p_loc + 15, 10]
+                popt, _ = curve_fit(double_lorentzian, x_local, y_local, p0=p0)
 
-    # 5. Diagnostic Plotting (The Error Check)
+                # Combined FWHM for a split peak is the span between the two peaks
+                # plus the average HWHM of both.
+                total_span = abs(popt[1] - popt[4]) + (abs(popt[2]) + abs(popt[5]))
+                results["fwhm_C"] = total_span
+                full_fit_visual[max(0, p_loc - win) : min(1024, p_loc + win)] += (
+                    double_lorentzian(x_local, *popt)
+                )
+            else:
+                # --- SINGLE LORENTZIAN FOR SIDES ---
+                p0 = [np.max(y_local), p_loc, 15]
+                popt, _ = curve_fit(lorentzian, x_local, y_local, p0=p0)
+                fwhm = abs(popt[2] * 2)
+
+                key = "fwhm_L" if i < center_idx_in_list else "fwhm_R"
+                results[key] = fwhm
+                full_fit_visual[max(0, p_loc - win) : min(1024, p_loc + win)] += (
+                    lorentzian(x_local, *popt)
+                )
+        except Exception:
+            continue
+
+    # 5. Diagnostic Plotting
     plt.figure(figsize=(12, 4))
     plt.subplot(1, 2, 1)
-    plt.imshow(img, cmap="gray")
-    plt.axhline(mid_y, color="red", alpha=0.3, ls="--")
-    for p in sorted_peaks:
-        plt.axvline(p, color="lime", alpha=0.6)
+    plt.imshow(img, cmap="gray", aspect="auto")
+    for p in best_peaks:
+        plt.axvline(p, color="lime", ls="--", alpha=0.7)
     plt.title(f"Image: {os.path.basename(image_path)}")
 
     plt.subplot(1, 2, 2)
-    plt.plot(x, profile, color="gray", alpha=0.3, label="Raw")
-    plt.plot(x, bg, "b--", label="Background")
-    plt.plot(x, clean_y, "k", label="Cleaned")
-    for p in sorted_peaks:
-        plt.plot(p, clean_y[p], "rx")
-    plt.title(f"Sharpness: {sharpness:.1f} | Flatness: {flatness:.2f}")
+    plt.plot(x, clean_y, color="gray", alpha=0.4, label="Data")
+    plt.plot(x, full_fit_visual, "r-", linewidth=2, label="Multi-Zone Fit")
+    plt.title(
+        f"C_FWHM: {results['fwhm_C']:.1f}px | Sharpness: {100 / (results['fwhm_C'] + EPSILON):.1f}"
+    )
     plt.legend(prop={"size": 8})
 
     plt.savefig(os.path.join(DIAG_DIR, f"diag_{os.path.basename(image_path)}.jpg"))
     plt.close()
 
+    # 6. Flatness Score (calculated on the center streak column)
+    center_loc = int(best_peaks[center_idx_in_list])
+    v_prof = img[:, center_loc].astype(float)
+    flatness = np.clip(1.0 - (np.std(v_prof) / (np.mean(v_prof) + EPSILON)), 0, 1)
+
     return {
         "group": group,
         "subgroup": subgroup,
         "filename": os.path.basename(image_path),
-        "fwhm_L": fwhms["L"],
-        "fwhm_C": fwhms["C"],
-        "fwhm_R": fwhms["R"],
-        "sharpness_score": round(sharpness, 2),
-        "flatness_score": round(flatness, 3),
-        "symmetry_error": round(sym_error, 2),
+        "fwhm_L": round(results["fwhm_L"], 2),
+        "fwhm_C": round(results["fwhm_C"], 2),
+        "fwhm_R": round(results["fwhm_R"], 2),
+        "sharpness": round(100 / (results["fwhm_C"] + EPSILON), 2),
+        "flatness": round(flatness, 3),
     }
 
-
-print(f"Current Working Directory: {os.getcwd()}")
-print(f"Looking for MBE folder at: {os.path.abspath(BASE_FOLDERS['mbe'])}")
 
 if __name__ == "__main__":
     for d in [OUTPUT_DIR, DIAG_DIR]:
         if not os.path.exists(d):
             os.makedirs(d)
 
-    all_results = []
+    final_data = []
     for label, base_path in BASE_FOLDERS.items():
         if not os.path.exists(base_path):
             continue
         print(f"Analyzing folder: {label}")
         for root, _, files in os.walk(base_path):
-            sub = os.path.relpath(root, base_path)
+            sub_label = os.path.relpath(root, base_path)
             for f in files:
                 if f.lower().endswith((".png", ".jpg", ".jpeg")):
-                    res = process_rheed(os.path.join(root, f), label, sub)
+                    res = process_rheed(os.path.join(root, f), label, sub_label)
                     if res:
-                        all_results.append(res)
+                        final_data.append(res)
 
-    df = pd.DataFrame(all_results)
-    df.to_csv(os.path.join(OUTPUT_DIR, "rheed_master_report.csv"), index=False)
-    print(f"\nReport generated! Total images processed: {len(df)}")
+    df = pd.DataFrame(final_data)
+    df.to_csv(os.path.join(OUTPUT_DIR, "rheed_final_lorentz_report.csv"), index=False)
+    print(f"\nReport created. Processed {len(df)} images.")
