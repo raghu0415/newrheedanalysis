@@ -7,7 +7,7 @@ from scipy.signal import find_peaks, savgol_filter
 from scipy.optimize import curve_fit
 
 # --- USER CONFIGURATION ---
-# These are the specific file prefixes that require the Double-Lorentzian fit
+# List of image numbers (from XX.3.png) that require the Double-Lorentzian fit
 DOUBLET_FILES = [11, 13, 14, 16, 17, 19, 20, 21, 25, 26, 28, 31]
 
 INPUT_DIR = "data/raw/mbesubstrate"
@@ -15,33 +15,35 @@ OUTPUT_DIR = "data/processed/physics_analysis/substrate"
 DIAG_DIR = os.path.join(OUTPUT_DIR, "diagnostics")
 
 
-# --- MODELS ---
-def lorentzian(x, amp, ctr, hwhm):
-    return amp * hwhm**2 / ((x - ctr) ** 2 + hwhm**2)
+# --- MODELS WITH DYNAMIC BASELINE (y0) ---
+def lorentzian(x, amp, ctr, hwhm, y0):
+    """Lorentzian that sits on a variable baseline (y0)."""
+    return (amp * hwhm**2 / ((x - ctr) ** 2 + hwhm**2)) + y0
 
 
-def double_lorentzian(x, a1, c1, w1, a2, c2, w2):
-    return lorentzian(x, a1, c1, w1) + lorentzian(x, a2, c2, w2)
+def double_lorentzian(x, a1, c1, w1, a2, c2, w2, y0):
+    """Double Lorentzian sharing a single background baseline."""
+    return lorentzian(x, a1, c1, w1, 0) + lorentzian(x, a2, c2, w2, 0) + y0
 
 
 def process_substrate(path):
-    img = cv2.imread(path, 0)
-    if img is None:
+    img_raw = cv2.imread(path, 0)
+    if img_raw is None:
         return None
-    img = cv2.resize(img, (1024, 1024))
+    img = cv2.resize(img_raw, (1024, 1024))
     filename = os.path.basename(path)
 
-    # Precise parsing for "11.3.png" -> 11
     try:
         file_num = int(filename.split(".")[0])
     except:
         file_num = -1
 
+    # Profile extraction from center band
     profile = np.mean(img[480:540, :], axis=0)
     smoothed = savgol_filter(profile, 25, 3)
 
-    # Catch peaks using prominence to handle background noise
-    peaks, props = find_peaks(smoothed, prominence=8, distance=150)
+    # Identify the three main streaks
+    peaks, _ = find_peaks(smoothed, prominence=8, distance=150)
     if len(peaks) < 3:
         peaks = np.argsort(smoothed)[-3:]
 
@@ -50,38 +52,91 @@ def process_substrate(path):
 
     x = np.arange(1024)
     visual_fit = np.zeros(1024)
-    res = {"filename": filename, "fwhm_L": 0.0, "fwhm_C": 0.0, "fwhm_R": 0.0}
+    # Added 'baseline' to the results dictionary to track it per image
+    res = {
+        "filename": filename,
+        "fwhm_L": 0.0,
+        "fwhm_C": 0.0,
+        "fwhm_R": 0.0,
+        "baseline": 0.0,
+    }
 
     for i, p_loc in enumerate(best_peaks):
-        win = 110
+        win = 120
         idx = np.arange(max(0, p_loc - win), min(1024, p_loc + win))
         x_loc = x[idx]
-        y_loc = smoothed[idx] - np.min(smoothed[idx])  # Local baseline correction
+        y_loc = smoothed[idx]
+
+        # Identify the floor guess for this specific image
+        floor_guess = np.min(y_loc)
 
         try:
-            # Force doublet logic for your specific list
             if i == center_idx and file_num in DOUBLET_FILES:
-                p0 = [np.max(y_loc), p_loc - 12, 8, np.max(y_loc), p_loc + 12, 8]
-                popt, _ = curve_fit(double_lorentzian, x_loc, y_loc, p0=p0, maxfev=5000)
+                # --- OFFSET DOUBLET FIT ---
+                amp_seed = np.max(y_loc) - floor_guess
+                p0 = [amp_seed, p_loc - 12, 15, amp_seed, p_loc + 12, 15, floor_guess]
+
+                # Bounds allow the baseline to find its true level
+                lower_b = [
+                    amp_seed * 0.5,
+                    p_loc - 40,
+                    5,
+                    amp_seed * 0.5,
+                    p_loc + 2,
+                    5,
+                    0,
+                ]
+                upper_b = [
+                    amp_seed * 3.0,
+                    p_loc - 2,
+                    65,
+                    amp_seed * 2.5,
+                    p_loc + 40,
+                    65,
+                    floor_guess + 50,
+                ]
+
+                popt, _ = curve_fit(
+                    double_lorentzian,
+                    x_loc,
+                    y_loc,
+                    p0=p0,
+                    bounds=(lower_b, upper_b),
+                    maxfev=5000,
+                )
                 visual_fit[idx] = double_lorentzian(x_loc, *popt)
-                res["fwhm_C"] = abs(popt[1] - popt[4]) + (abs(popt[2]) + abs(popt[5]))
+                res["fwhm_C"] = round(
+                    abs(popt[1] - popt[4]) + (abs(popt[2]) + abs(popt[5])), 2
+                )
+                res["baseline"] = round(popt[6], 2)  # Capture calculated baseline
             else:
-                p0 = [np.max(y_loc), p_loc, 10]
-                popt, _ = curve_fit(lorentzian, x_loc, y_loc, p0=p0, maxfev=3000)
+                # --- OFFSET SINGLET FIT ---
+                amp_seed = np.max(y_loc) - floor_guess
+                p0 = [amp_seed, p_loc, 15, floor_guess]
+                lower_b = [amp_seed * 0.5, p_loc - 35, 5, 0]
+                upper_b = [amp_seed * 2.5, p_loc + 35, 65, floor_guess + 50]
+
+                popt, _ = curve_fit(
+                    lorentzian,
+                    x_loc,
+                    y_loc,
+                    p0=p0,
+                    bounds=(lower_b, upper_b),
+                    maxfev=3000,
+                )
                 visual_fit[idx] = lorentzian(x_loc, *popt)
                 key = ["fwhm_L", "fwhm_C", "fwhm_R"][i]
-                res[key] = abs(popt[2] * 2)
+                res[key] = round(abs(popt[2] * 2), 2)
+                if i == center_idx:
+                    res["baseline"] = round(popt[3], 2)
         except:
             continue
 
-    # Diagnostic output
-    plt.figure(figsize=(10, 4))
-    plt.plot(
-        x, smoothed - np.percentile(smoothed, 10), color="gray", alpha=0.4, label="Data"
-    )
-    plt.plot(x, visual_fit, color="red", lw=2, label="Fit Model")
-    mode_label = "DOUBLET" if file_num in DOUBLET_FILES else "STANDARD"
-    plt.title(f"{filename} | Mode: {mode_label} | C_FWHM: {res['fwhm_C']:.1f}")
+    # Diagnostic plot showing the true baseline
+    plt.figure(figsize=(10, 5))
+    plt.plot(x, smoothed, color="gray", alpha=0.3, label="Raw Data")
+    plt.plot(x, visual_fit, color="red", lw=2.5, label="Model Fit (with Baseline)")
+    plt.title(f"{filename} | Calculated Baseline: {res['baseline']}")
     plt.legend()
     plt.savefig(os.path.join(DIAG_DIR, f"diag_{filename}.jpg"))
     plt.close()
@@ -91,10 +146,9 @@ def process_substrate(path):
 
 if __name__ == "__main__":
     os.makedirs(DIAG_DIR, exist_ok=True)
-    all_files = [f for f in os.listdir(INPUT_DIR) if f.lower().endswith(".png")]
+    all_files = sorted([f for f in os.listdir(INPUT_DIR) if f.lower().endswith(".png")])
     results = [process_substrate(os.path.join(INPUT_DIR, f)) for f in all_files]
-
     pd.DataFrame([r for r in results if r]).to_csv(
-        os.path.join(OUTPUT_DIR, "substrate_results_final.csv"), index=False
+        os.path.join(OUTPUT_DIR, "final_substrate_results.csv"), index=False
     )
-    print(f"Finished. Diagnostics saved to {DIAG_DIR}")
+    print("Done. Check the CSV for the 'baseline' column to see the calculated values.")
